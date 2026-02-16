@@ -51,7 +51,7 @@ class MediaDownloader:
             if pbar: pbar.update(1)
             return True
         except Exception as e:
-            print(f"Error downloading {url}: {e}")
+            if pbar: pbar.update(1)
             return False
 
     def decrypt_mp4(self, input_path, output_path):
@@ -129,7 +129,6 @@ class MediaDownloader:
         mpd = MPEGDASHParser.parse(response.text)
         
         period = mpd.periods[0]
-        # Select best video adaptation set
         video_sets = [s for s in period.adaptation_sets if s.content_type == 'video' or (not s.content_type and any(r.width for r in s.representations))]
         if not video_sets:
             print("No video adaptation set found.")
@@ -138,7 +137,7 @@ class MediaDownloader:
         v_set = video_sets[0]
         best_rep = max(v_set.representations, key=lambda r: r.bandwidth)
         
-        base_url = self.input_url.rsplit('/', 1)[0] + '/'
+        base_url = self.input_url.split('?')[0].rsplit('/', 1)[0] + '/'
         if best_rep.base_urls:
             base_url = urljoin(base_url, best_rep.base_urls[0].base_url_value)
         elif v_set.base_urls:
@@ -149,6 +148,9 @@ class MediaDownloader:
         # Initialization
         init_url = template.initialization.replace('$RepresentationID$', str(best_rep.id))
         init_url = urljoin(base_url, init_url)
+        if '?' in self.input_url:
+            init_url += ('&' if '?' in init_url else '?') + self.input_url.split('?', 1)[1]
+            
         init_path = os.path.join(self.tmp_dir, "init.mp4")
         print(f"Downloading initialization: {init_url}")
         self.download_segment(init_url, init_path)
@@ -158,25 +160,39 @@ class MediaDownloader:
         if template.segment_timelines:
             timeline = template.segment_timelines[0]
             current_time = 0
-            for s in timeline.s:
-                t = s.t if s.t is not None else current_time
-                d = s.d
-                r = s.r if s.r is not None else 0
+            # mpegdash uses lowercase 's' for segments in some versions or direct mapping
+            # Let's try to access it more safely
+            segments_list = []
+            if hasattr(timeline, 's'): segments_list = timeline.s
+            elif hasattr(timeline, 'segments'): segments_list = timeline.segments
+            elif hasattr(timeline, 'S'): segments_list = timeline.S
+            
+            for s in segments_list:
+                t = s.t if hasattr(s, 't') and s.t is not None else current_time
+                d = s.d if hasattr(s, 'd') else 0
+                r = s.r if hasattr(s, 'r') and s.r is not None else 0
                 for i in range(r + 1):
-                    seg_url = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Time$', str(t))
-                    seg_urls.append(urljoin(base_url, seg_url))
+                    seg_url_part = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Time$', str(t))
+                    full_seg_url = urljoin(base_url, seg_url_part)
+                    if '?' in self.input_url:
+                        full_seg_url += ('&' if '?' in full_seg_url else '?') + self.input_url.split('?', 1)[1]
+                    seg_urls.append(full_seg_url)
                     t += d
                 current_time = t
         else:
-            # Fallback to $Number$
             start_number = template.start_number if template.start_number is not None else 1
-            # For VOD, we might need to calculate the number of segments
-            # This is a simplified fallback
-            for i in range(start_number, start_number + 100): # Limit to 100 for safety if no timeline
-                seg_url = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Number$', str(i))
-                seg_urls.append(urljoin(base_url, seg_url))
+            for i in range(start_number, start_number + 100):
+                seg_url_part = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Number$', str(i))
+                full_seg_url = urljoin(base_url, seg_url_part)
+                if '?' in self.input_url:
+                    full_seg_url += ('&' if '?' in full_seg_url else '?') + self.input_url.split('?', 1)[1]
+                seg_urls.append(full_seg_url)
 
         print(f"Total segments to download: {len(seg_urls)}")
+        if not seg_urls:
+            print("No segments found to download.")
+            return
+
         with tqdm(total=len(seg_urls), desc="Downloading DASH") as pbar:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
                 futures = []
