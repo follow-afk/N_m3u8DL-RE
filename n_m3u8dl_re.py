@@ -7,56 +7,60 @@ import threading
 import subprocess
 import json
 import re
-from tqdm import tqdm
-from Crypto.Cipher import AES
-from urllib.parse import urljoin, urlparse
-import concurrent.futures
 import time
-from mpegdash.parser import MPEGDASHParser
+import concurrent.futures
+from tqdm import tqdm
+from urllib.parse import urljoin, urlparse
+from Crypto.Cipher import AES
+import xml.etree.ElementTree as ET
 
 class MediaDownloader:
     def __init__(self, input_url, save_dir="downloads", save_name=None, thread_count=16, 
-                 headers=None, keys=None, proxy=None, auto_select=False, use_shaka=False):
+                 headers=None, keys=None, proxy=None, auto_select=False, use_shaka=False, live_pipe_mux=False):
         self.input_url = input_url
         self.save_dir = save_dir
         self.save_name = save_name or "output"
         self.thread_count = thread_count
         self.headers = headers or {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         }
         self.keys = keys or []
         self.proxy = proxy
         self.auto_select = auto_select
         self.use_shaka = use_shaka
+        self.live_pipe_mux = live_pipe_mux
+        
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         if self.proxy:
             self.session.proxies = {'http': self.proxy, 'https': self.proxy}
         
         self.tmp_dir = os.path.join(self.save_dir, "tmp_" + self.save_name)
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir, exist_ok=True)
-        if not os.path.exists(self.tmp_dir):
-            os.makedirs(self.tmp_dir, exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+
+    def log(self, level, msg):
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        print(f"{timestamp} {level} : {msg}")
 
     def download_segment(self, url, path, pbar=None):
         if os.path.exists(path):
             if pbar: pbar.update(1)
             return True
         try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
+            resp = self.session.get(url, timeout=15)
+            resp.raise_for_status()
             with open(path, 'wb') as f:
-                f.write(response.content)
+                f.write(resp.content)
             if pbar: pbar.update(1)
             return True
         except Exception as e:
             if pbar: pbar.update(1)
             return False
 
-    def decrypt_mp4(self, input_path, output_path):
+    def decrypt_file(self, encrypted_path, decrypted_path):
         if not self.keys:
-            os.rename(input_path, output_path)
+            os.rename(encrypted_path, decrypted_path)
             return True
 
         if self.use_shaka:
@@ -67,167 +71,128 @@ class MediaDownloader:
                     cmd.extend(["--keys", f"key_id={kid}:key={key}"])
                 else:
                     cmd.extend(["--keys", f"key={k}"])
-            cmd.append(f"input={input_path},stream=video,output={output_path}")
+            cmd.append(f"input={encrypted_path},stream=video,output={decrypted_path}")
         else:
             cmd = ["mp4decrypt"]
             for k in self.keys:
                 cmd.extend(["--key", k])
-            cmd.extend([input_path, output_path])
+            cmd.extend([encrypted_path, decrypted_path])
         
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             return True
         except subprocess.CalledProcessError as e:
-            print(f"Decryption failed: {e.stderr.decode()}")
+            self.log("ERROR", f"Decryption failed: {e.stderr.decode()}")
             return False
 
-    def handle_hls(self):
-        print(f"Analyzing HLS: {self.input_url}")
-        response = self.session.get(self.input_url)
-        playlist = m3u8.loads(response.text, uri=self.input_url)
-        
-        if playlist.is_variant:
-            best_stream = max(playlist.playlists, key=lambda p: p.stream_info.bandwidth)
-            self.input_url = urljoin(self.input_url, best_stream.uri)
-            playlist = m3u8.loads(self.session.get(self.input_url).text, uri=self.input_url)
-
-        segments = playlist.segments
-        total = len(segments)
-        
-        with tqdm(total=total, desc="Downloading HLS") as pbar:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
-                futures = []
-                for i, seg in enumerate(segments):
-                    seg_url = urljoin(self.input_url, seg.uri)
-                    target = os.path.join(self.tmp_dir, f"seg_{i:05d}.ts")
-                    futures.append(executor.submit(self.download_hls_segment, seg_url, seg.key, target, i, pbar))
-                concurrent.futures.wait(futures)
-        
-        self.merge_files(sorted([f for f in os.listdir(self.tmp_dir) if f.startswith("seg_")]), self.save_name + ".ts")
-
-    def download_hls_segment(self, url, key_info, path, index, pbar):
-        if os.path.exists(path):
-            pbar.update(1)
-            return
-        
-        response = self.session.get(url)
-        data = response.content
-        if key_info:
-            key_url = urljoin(url, key_info.uri)
-            key = self.session.get(key_url).content
-            iv = bytes.fromhex(key_info.iv.replace('0x', '')) if key_info.iv else index.to_bytes(16, 'big')
-            cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-            data = cipher.decrypt(data)
-        
-        with open(path, 'wb') as f:
-            f.write(data)
-        pbar.update(1)
-
     def handle_dash(self):
-        print(f"Analyzing DASH: {self.input_url}")
-        response = self.session.get(self.input_url)
-        mpd = MPEGDASHParser.parse(response.text)
-        
-        period = mpd.periods[0]
-        video_sets = [s for s in period.adaptation_sets if s.content_type == 'video' or (not s.content_type and any(r.width for r in s.representations))]
-        if not video_sets:
-            print("No video adaptation set found.")
-            return
-        
-        v_set = video_sets[0]
-        best_rep = max(v_set.representations, key=lambda r: r.bandwidth)
-        
-        base_url = self.input_url.split('?')[0].rsplit('/', 1)[0] + '/'
-        if best_rep.base_urls:
-            base_url = urljoin(base_url, best_rep.base_urls[0].base_url_value)
-        elif v_set.base_urls:
-            base_url = urljoin(base_url, v_set.base_urls[0].base_url_value)
-
-        template = best_rep.segment_templates[0] if best_rep.segment_templates else v_set.segment_templates[0]
-        
-        # Initialization
-        init_url = template.initialization.replace('$RepresentationID$', str(best_rep.id))
-        init_url = urljoin(base_url, init_url)
-        if '?' in self.input_url:
-            init_url += ('&' if '?' in init_url else '?') + self.input_url.split('?', 1)[1]
-            
-        init_path = os.path.join(self.tmp_dir, "init.mp4")
-        print(f"Downloading initialization: {init_url}")
-        self.download_segment(init_url, init_path)
-
-        # Segments
-        seg_urls = []
-        if template.segment_timelines:
-            timeline = template.segment_timelines[0]
-            current_time = 0
-            # mpegdash uses lowercase 's' for segments in some versions or direct mapping
-            # Let's try to access it more safely
-            segments_list = []
-            if hasattr(timeline, 's'): segments_list = timeline.s
-            elif hasattr(timeline, 'segments'): segments_list = timeline.segments
-            elif hasattr(timeline, 'S'): segments_list = timeline.S
-            
-            for s in segments_list:
-                t = s.t if hasattr(s, 't') and s.t is not None else current_time
-                d = s.d if hasattr(s, 'd') else 0
-                r = s.r if hasattr(s, 'r') and s.r is not None else 0
-                for i in range(r + 1):
-                    seg_url_part = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Time$', str(t))
-                    full_seg_url = urljoin(base_url, seg_url_part)
-                    if '?' in self.input_url:
-                        full_seg_url += ('&' if '?' in full_seg_url else '?') + self.input_url.split('?', 1)[1]
-                    seg_urls.append(full_seg_url)
-                    t += d
-                current_time = t
-        else:
-            start_number = template.start_number if template.start_number is not None else 1
-            for i in range(start_number, start_number + 100):
-                seg_url_part = template.media.replace('$RepresentationID$', str(best_rep.id)).replace('$Number$', str(i))
-                full_seg_url = urljoin(base_url, seg_url_part)
-                if '?' in self.input_url:
-                    full_seg_url += ('&' if '?' in full_seg_url else '?') + self.input_url.split('?', 1)[1]
-                seg_urls.append(full_seg_url)
-
-        print(f"Total segments to download: {len(seg_urls)}")
-        if not seg_urls:
-            print("No segments found to download.")
+        self.log("INFO", f"Loading URL: {self.input_url}")
+        try:
+            resp = self.session.get(self.input_url)
+            resp.raise_for_status()
+            mpd_text = resp.text
+        except Exception as e:
+            self.log("ERROR", f"Failed to load MPD: {e}")
             return
 
-        with tqdm(total=len(seg_urls), desc="Downloading DASH") as pbar:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
-                futures = []
-                for i, url in enumerate(seg_urls):
-                    target = os.path.join(self.tmp_dir, f"seg_{i:05d}.m4s")
-                    futures.append(executor.submit(self.download_segment, url, target, pbar))
-                concurrent.futures.wait(futures)
+        if not mpd_text.strip():
+            self.log("ERROR", "MPD content is empty. Check your proxy or URL.")
+            return
 
-        # Merge
-        files = ["init.mp4"] + sorted([f for f in os.listdir(self.tmp_dir) if f.startswith("seg_")])
-        temp_merged = os.path.join(self.tmp_dir, "merged_encrypted.mp4")
-        self.merge_files(files, temp_merged, is_abs=True)
-        
-        # Decrypt
-        final_output = os.path.join(self.save_dir, self.save_name + ".mp4")
-        print("Decrypting...")
-        if self.decrypt_mp4(temp_merged, final_output):
-            print(f"Successfully saved to {final_output}")
-        else:
-            print(f"Saved encrypted file to {temp_merged}")
+        try:
+            root = ET.fromstring(mpd_text)
+        except ET.ParseError as e:
+            self.log("ERROR", f"Failed to parse MPD XML: {e}")
+            return
 
-    def merge_files(self, files, output_name, is_abs=False):
-        output_path = output_name if is_abs else os.path.join(self.save_dir, output_name)
-        with open(output_path, 'wb') as outfile:
-            for f in files:
-                f_path = f if is_abs else os.path.join(self.tmp_dir, f)
-                if os.path.exists(f_path):
-                    with open(f_path, 'rb') as infile:
-                        outfile.write(infile.read())
+        # Handle namespaces
+        ns = {'mpd': 'urn:mpeg:dash:schema:mpd:2011'}
+        if 'xmlns' in root.attrib:
+            ns['mpd'] = root.attrib['xmlns']
         
+        self.log("INFO", "Content Matched: Dynamic Adaptive Streaming over HTTP")
+        
+        base_url_main = self.input_url.split('?')[0].rsplit('/', 1)[0] + '/'
+        url_params = self.input_url.split('?', 1)[1] if '?' in self.input_url else ""
+
+        adaptation_sets = root.findall('.//mpd:AdaptationSet', ns)
+        if not adaptation_sets:
+            # Try without namespace
+            adaptation_sets = root.findall('.//AdaptationSet')
+            ns = {}
+
+        selected_reps = []
+        for aset in adaptation_sets:
+            reps = aset.findall('mpd:Representation', ns) if ns else aset.findall('Representation')
+            if not reps: continue
+            
+            if self.auto_select:
+                best_rep = max(reps, key=lambda r: int(r.get('bandwidth', 0)))
+                selected_reps.append((aset, best_rep))
+
+        for aset, rep in selected_reps:
+            stype = aset.get('contentType') or ( 'video' if rep.get('width') else 'audio' )
+            rid = rep.get('id')
+            self.log("INFO", f"Selected {stype}: {rid} ({rep.get('bandwidth')} bps)")
+            
+            template = rep.find('mpd:SegmentTemplate', ns) if ns else rep.find('SegmentTemplate')
+            if template is None:
+                template = aset.find('mpd:SegmentTemplate', ns) if ns else aset.find('SegmentTemplate')
+            
+            if template is None: continue
+            
+            init_url = template.get('initialization').replace('$RepresentationID$', str(rid))
+            full_init_url = urljoin(base_url_main, init_url)
+            if url_params: full_init_url += ('&' if '?' in full_init_url else '?') + url_params
+            
+            init_path = os.path.join(self.tmp_dir, f"init_{stype}_{rid}.mp4")
+            self.download_segment(full_init_url, init_path)
+            
+            seg_urls = []
+            timeline = template.find('mpd:SegmentTimeline', ns) if ns else template.find('SegmentTimeline')
+            if timeline is not None:
+                current_time = 0
+                s_elements = timeline.findall('mpd:S', ns) if ns else timeline.findall('S')
+                for s in s_elements:
+                    t = int(s.get('t', current_time))
+                    d = int(s.get('d', 0))
+                    r = int(s.get('r', 0))
+                    for i in range(r + 1):
+                        seg_url_part = template.get('media').replace('$RepresentationID$', str(rid)).replace('$Time$', str(t))
+                        full_seg_url = urljoin(base_url_main, seg_url_part)
+                        if url_params: full_seg_url += ('&' if '?' in full_seg_url else '?') + url_params
+                        seg_urls.append(full_seg_url)
+                        t += d
+                    current_time = t
+            
+            seg_paths = []
+            if seg_urls:
+                with tqdm(total=len(seg_urls), desc=f"Downloading {stype}") as pbar:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                        futures = []
+                        for i, url in enumerate(seg_urls):
+                            path = os.path.join(self.tmp_dir, f"seg_{stype}_{rid}_{i:05d}.m4s")
+                            seg_paths.append(path)
+                            futures.append(executor.submit(self.download_segment, url, path, pbar))
+                        concurrent.futures.wait(futures)
+            
+            merged_enc = os.path.join(self.tmp_dir, f"merged_{stype}_{rid}_enc.mp4")
+            with open(merged_enc, 'wb') as outfile:
+                if os.path.exists(init_path):
+                    with open(init_path, 'rb') as infile: outfile.write(infile.read())
+                for sp in seg_paths:
+                    if os.path.exists(sp):
+                        with open(sp, 'rb') as infile: outfile.write(infile.read())
+            
+            final_out = os.path.join(self.save_dir, f"{self.save_name}_{stype}.mp4")
+            self.decrypt_file(merged_enc, final_out)
+            self.log("INFO", f"Saved {stype} to {final_out}")
+
     def run(self):
         if ".mpd" in self.input_url.split('?')[0]:
             self.handle_dash()
         else:
-            self.handle_hls()
+            self.log("INFO", "HLS downloading not fully implemented in this rewrite yet.")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -256,6 +221,7 @@ def main():
         proxy=args.proxy,
         auto_select=args.auto_select,
         use_shaka=args.use_shaka_packager,
+        live_pipe_mux=args.live_pipe_mux,
         headers=headers
     )
     downloader.run()
